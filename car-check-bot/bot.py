@@ -90,32 +90,96 @@ def translate_name(raw: str) -> str:
     result = re.sub(r'\s+', ' ', result).strip()
     return result or "—"
 
-# ── Encar API ─────────────────────────────────────────────────────────────────
-async def parse_encar_api(car_id: str) -> dict:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-        "Accept": "application/json",
-        "Referer": f"https://fem.encar.com/cars/detail/{car_id}",
-    }
+# ── Чтение объявления с сайта (Encar / KBChaChaCha) ───────────────────────────
+KR_PROXY_URL = os.environ.get("KR_PROXY_URL", "") or None   # необязательно: прокси с корейским IP
+
+WEB_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 "
+                  "(KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    "Accept": "application/json, text/html;q=0.9, */*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.5",
+}
+
+def _client(timeout=15):
+    return httpx.AsyncClient(timeout=timeout, follow_redirects=True, proxy=KR_PROXY_URL)
+
+def find_listing(text: str):
+    """Ищет ссылку Encar / KBChaChaCha в тексте. Возвращает (сайт, id, url) или None."""
+    m = re.search(r"https?://\S*encar\.com\S*?/(?:cars/detail|detail)/(\d+)\S*", text) \
+        or re.search(r"https?://\S*encar\.com\S*carid=(\d+)\S*", text, re.I)
+    if m:
+        return "encar", m.group(1), m.group(0)
+    m = re.search(r"https?://\S*kbchachacha\.com\S*?carSeq=(\d+)\S*", text, re.I)
+    if m:
+        return "kb", m.group(1), m.group(0)
+    return None
+
+async def fetch_encar(car_id: str, log: list = None) -> dict:
+    headers = {**WEB_HEADERS, "Origin": "https://fem.encar.com",
+               "Referer": f"https://fem.encar.com/cars/detail/{car_id}"}
+    url = f"https://api.encar.com/v1/readside/vehicle/{car_id}"
+    async with _client() as client:
+        resp = await client.get(url, headers=headers)
+    msg = f"encar {resp.status_code} {len(resp.content)}b"
+    logger.info(msg)
+    if log is not None:
+        log.append(f"{url} → {resp.status_code}, {len(resp.content)} байт\n{resp.text[:200]!r}")
+    if resp.status_code != 200:
+        return {}
+    d = resp.json()
+    cat = d.get("category", {}) or {}
+    brand_kr = cat.get("manufacturerName", "") or ""
+    brand = translate_name(brand_kr) if brand_kr in BRAND_MAP else (cat.get("manufacturerEnglishName") or brand_kr)
+    model = cat.get("modelGroupEnglishName") or translate_name(cat.get("modelGroupName", "") or cat.get("modelName", ""))
+    name = f"{brand} {model}".strip()
+    price_man = (d.get("advertisement", {}) or {}).get("price")
+    address = (d.get("contact", {}) or {}).get("address", "") or ""
+    out = {}
+    if name:
+        out["name"] = name
+    if d.get("vehicleNo"):
+        out["plate"] = d["vehicleNo"]
+    if price_man:
+        out["price"] = str(int(price_man) * 10000)
+    if address:
+        out["city"] = translate_city(address)
+    return out
+
+async def fetch_kb(car_seq: str, log: list = None) -> dict:
+    url = f"https://www.kbchachacha.com/public/car/detail.kbc?carSeq={car_seq}"
+    async with _client() as client:
+        resp = await client.get(url, headers={**WEB_HEADERS, "Accept": "text/html"})
+    logger.info(f"kb {resp.status_code} {len(resp.content)}b")
+    if log is not None:
+        log.append(f"{url} → {resp.status_code}, {len(resp.content)} байт\n{resp.text[:200]!r}")
+    if resp.status_code != 200:
+        return {}
+    html = resp.text
+    out = {}
+    t = re.search(r'<meta property="og:title" content="([^"]+)"', html) or re.search(r"<title>([^<]+)</title>", html)
+    if t:
+        title = re.split(r"[|\-–]", t.group(1))[0]
+        out["name"] = translate_name(title)
+    p = re.search(r"([\d,]{3,})\s*만원", html)
+    if p:
+        out["price"] = str(int(p.group(1).replace(",", "")) * 10000)
+    pl = re.search(r"(\d{2,3}\s?[가-힣]\s?\d{4})", html)
+    if pl:
+        out["plate"] = pl.group(1).replace(" ", "")
+    return out
+
+async def fetch_listing(url_text: str, log: list = None) -> dict:
+    found = find_listing(url_text)
+    if not found:
+        return {}
+    site, listing_id, _ = found
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"https://api.encar.com/search/car/list/mobile?count=1&q=(Id:{car_id})",
-                headers=headers,
-            )
-            if resp.status_code == 200:
-                cars = resp.json().get("SearchResults", [])
-                if cars:
-                    c = cars[0]
-                    name_raw = f"{c.get('Manufacturer','')} {c.get('Model','')} {c.get('Badge','')}".strip()
-                    city_raw = c.get("OfficeCityState", "") or c.get("ServiceCoporation", "") or ""
-                    return {
-                        "name": translate_name(name_raw) or "—",
-                        "city": translate_city(city_raw),
-                    }
-    except Exception:
-        pass
-    return {}
+        return await (fetch_encar if site == "encar" else fetch_kb)(listing_id, log)
+    except Exception as e:
+        logger.warning(f"fetch {site} failed: {e}")
+        if log is not None:
+            log.append(f"ошибка: {e}")
+        return {}
 
 # ── Извлечение полей через LLM ────────────────────────────────────────────────
 async def extract_fields_llm(text: str) -> dict:
@@ -550,23 +614,36 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Car-check: ссылка ─────────────────────────────────────────────────────────
 async def handle_encar_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    url = (update.message.text or "").strip()
+    text_in = (update.message.text or "").strip()
+    found = find_listing(text_in)
+    url = found[2] if found else text_in
     ctx.user_data["cc"] = {"url": url}
-    match = re.search(r'/detail/(\d+)', url)
-    car_id = match.group(1) if match else None
     wait_msg = await update.message.reply_text("⏳ Загружаю данные авто...")
-    parsed = await parse_encar_api(car_id) if car_id else {}
-    ctx.user_data["cc"]["name"] = parsed.get("name", "—")
-    ctx.user_data["cc"]["city"] = parsed.get("city", "—")
+    parsed = await fetch_listing(text_in)
+    for key in ("name", "plate", "price", "city"):
+        if parsed.get(key):
+            ctx.user_data["cc"][key] = parsed[key]
     await wait_msg.delete()
-    text, kb = build_car_form(ctx.user_data["cc"])
+    form_text, kb = build_car_form(ctx.user_data["cc"])
+    note = ("✅ Данные с сайта прочитаны. Допиши остальное." if parsed
+            else "⚠️ Сайт не отдал данные. Заполни вручную или отправь голосовое.")
     form_msg = await update.message.reply_text(
-        text + "\n\n_Или отправь голосовое/текст со всеми данными сразу_ 🎤",
+        form_text + f"\n\n_{note}_ 🎤",
         parse_mode="Markdown", reply_markup=kb
     )
     ctx.user_data["cc_msg"]  = form_msg.message_id
     ctx.user_data["cc_chat"] = form_msg.chat_id
     return FILLING
+
+async def cmd_probe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/probe <ссылка> — показывает, что ответил сайт (для диагностики)."""
+    text = " ".join(ctx.args) if ctx.args else ""
+    if not find_listing(text):
+        await update.message.reply_text("Использование: /probe <ссылка Encar или KBChaChaCha>")
+        return
+    log = []
+    parsed = await fetch_listing(text, log)
+    await update.message.reply_text(("\n\n".join(log) + f"\n\nРезультат: {parsed}")[:3500])
 
 # ── Car-check: текст/голос заполняет всю форму сразу ─────────────────────────
 async def car_fill_from_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -752,7 +829,7 @@ def main():
 
     car_conv = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.TEXT & filters.Regex(r"encar\.com"), handle_encar_link),
+            MessageHandler(filters.TEXT & filters.Regex(r"encar\.com|kbchachacha\.com"), handle_encar_link),
         ],
         states={
             FILLING: [
@@ -771,6 +848,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("probe", cmd_probe))
     app.add_handler(car_conv)
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

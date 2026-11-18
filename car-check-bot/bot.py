@@ -240,6 +240,33 @@ def parse_record(d: dict) -> list:
         bits.append("угон")
     return bits
 
+def extract_dealer_name(d: dict) -> str:
+    """Компания и имя дилера из объявления (поля Encar подбираются с запасом)."""
+    def dig(node, *path):
+        for p in path:
+            node = node.get(p) if isinstance(node, dict) else None
+        return node if isinstance(node, str) else ""
+    firm = dig(d, "partnership", "dealer", "firm", "name") or dig(d, "partnership", "firm", "name") \
+        or dig(d, "contact", "firmName") or dig(d, "seller", "firmName")
+    person = dig(d, "partnership", "dealer", "name") or dig(d, "contact", "userName") \
+        or dig(d, "contact", "name") or dig(d, "seller", "name")
+    if not (firm or person):                       # запасной поиск по любым ключам
+        keys = {"dealername": 1, "firmname": 0, "companyname": 0, "sellername": 1}
+        res = {0: "", 1: ""}
+        def walk(n):
+            if isinstance(n, dict):
+                for k, v in n.items():
+                    if isinstance(v, str) and str(k).lower() in keys and v.strip():
+                        res[keys[str(k).lower()]] = res[keys[str(k).lower()]] or v.strip()
+                    else:
+                        walk(v)
+            elif isinstance(n, list):
+                for v in n:
+                    walk(v)
+        walk(d)
+        firm, person = res[0], res[1]
+    return " ".join(x.strip() for x in (firm, person) if x and x.strip())
+
 async def fetch_encar(car_id: str, log: list = None) -> dict:
     headers = {**WEB_HEADERS, "Origin": "https://fem.encar.com",
                "Referer": f"https://fem.encar.com/cars/detail/{car_id}"}
@@ -270,6 +297,9 @@ async def fetch_encar(car_id: str, log: list = None) -> dict:
     if address:
         out["city"] = translate_city(address)
     dealer_text = collect_dealer_text(d)
+    dealer_name = extract_dealer_name(d)
+    if dealer_name:
+        out["dealer"] = dealer_name
 
     # осмотр и страховая история — параллельно
     plate = d.get("vehicleNo") or ""
@@ -448,7 +478,7 @@ def format_car_card(d: dict) -> str:
         "",
         f"Мальсо: {d.get('malso', '—')}",
         "",
-        f"📍 {d.get('city', '—')}",
+        f"📍 {d.get('city', '—')}" + (f"\n🏢 {d['dealer']}" if d.get("dealer") and d.get("dealer") != "—" else ""),
         "",
         "⚠️ Перед осмотром обязательно связаться с дилером",
     ])
@@ -473,7 +503,8 @@ def build_car_form(d: dict):
         f"📋 *Кесансо:* {fmt_money(fv(d,'kesanso'))}\n"
         f"💰 *Медоби:* {fmt_money(fv(d,'medobi'))}\n"
         f"📅 *Мальсо:* {fv(d,'malso')}\n"
-        f"📍 *Город:* {fv(d,'city')}"
+        f"📍 *Город:* {fv(d,'city')}\n"
+        f"🏢 *Дилер:* {fv(d,'dealer')}"
     )
     rows = [
         [InlineKeyboardButton(f"🚗 Марка и модель{' ✅' if d.get('name') and d.get('name') != '—' else ' ✏️'}", callback_data="cc_edit_name")],
@@ -505,6 +536,7 @@ def build_car_form(d: dict):
             InlineKeyboardButton("Другое", callback_data="cc_mal_input"),
         ],
         [InlineKeyboardButton(f"📍 Город{' ✅' if d.get('city') and d.get('city') != '—' else ' ✏️'}", callback_data="cc_edit_city")],
+        [InlineKeyboardButton(f"🏢 Дилер{' ✅' if d.get('dealer') and d.get('dealer') != '—' else ' ✏️'}", callback_data="cc_edit_dealer")],
     ]
     required = ["name", "plate", "price", "keys", "condition", "kesanso", "medobi", "malso", "city"]
     if all(d.get(k) and d.get(k) != "—" for k in required):
@@ -802,7 +834,7 @@ async def handle_encar_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["cc"] = {"url": url}
     wait_msg = await update.message.reply_text("⏳ Загружаю данные авто...")
     parsed = await fetch_listing(text_in)
-    for key in ("name", "plate", "price", "city", "keys", "condition", "kesanso"):
+    for key in ("name", "plate", "price", "city", "dealer", "keys", "condition", "kesanso"):
         if parsed.get(key):
             ctx.user_data["cc"][key] = parsed[key]
     await wait_msg.delete()
@@ -963,6 +995,7 @@ async def car_button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "cc_med_input":  ("cc_medobi_input",  "✏️ Введи сумму медоби:"),
         "cc_mal_input":  ("cc_malso_input",   "✏️ Введи дату или срок мальсо:"),
         "cc_edit_city":  ("cc_city_input",    "✏️ Введи *город*:"),
+        "cc_edit_dealer": ("cc_dealer_input", "✏️ Введи *компанию / имя дилера*:"),
     }
     if d_key in prompts:
         field, prompt = prompts[d_key]
@@ -980,7 +1013,7 @@ async def car_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     field_map = {
         "cc_name_input": "name", "cc_plate_input": "plate", "cc_price_input": "price",
         "cc_kesanso_input": "kesanso", "cc_medobi_input": "medobi",
-        "cc_malso_input": "malso", "cc_city_input": "city",
+        "cc_malso_input": "malso", "cc_city_input": "city", "cc_dealer_input": "dealer",
     }
     if field in field_map:
         cc[field_map[field]] = val

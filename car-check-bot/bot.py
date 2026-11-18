@@ -16,6 +16,7 @@ from googleapiclient.discovery import build
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # не печатать токен в логах
 
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_BOT_TOKEN"]
 GROQ_API_KEY      = os.environ["GROQ_API_KEY"]
@@ -426,17 +427,47 @@ def format_full_calc(data: dict) -> str:
     return "\n".join(lines)
 
 def format_dealer(data: dict) -> str:
-    price = data["price_krw"]; medobi = data["medobi_krw"]
-    torg  = data["torg_krw"];  zalog  = data["zalog_krw"]
-    ostatok = price - zalog - torg
+    """Фиксированный формат расчёта с дилером. Арифметику делает Python, не модель."""
+    price  = abs(int(data.get("price_krw", 0) or 0))
+    torg   = abs(int(data.get("torg_krw", 0) or 0))
+    zalog  = abs(int(data.get("zalog_krw", 0) or 0))
+    medobi = abs(int(data.get("medobi_krw", 0) or 0))
+    ostatok = price - torg - zalog + medobi
     return "\n".join([
-        f"💵 *Расчёт с дилером*", "",
-        f"Цена: {fmt(price)}₩ | Медоби: {fmt(medobi)}₩ | Торг: {fmt(torg)}₩ | Залог: {fmt(zalog)}₩", "",
-        f"*Остаток: {fmt(ostatok)} + {fmt(medobi)} = {fmt(ostatok+medobi)}₩*",
+        "Давай считать:", "",
+        f"Цена по сайту: {price:,}",
+        f"Минус торг: -{torg:,}",
+        f"Минус залог: -{zalog:,}",
+        f"Плюс медоби: +{medobi:,}", "",
+        f"Остаток дилеру: {ostatok:,}",
     ])
+
+def _num(s: str) -> int:
+    d = re.sub(r"[^\d]", "", s or "")
+    return int(d) if d else 0
+
+def parse_dealer_text(text: str):
+    """Разбор шаблона «Расчёт с дилером» без нейросети. None, если это не шаблон."""
+    t = text.lower().replace("ё", "е")
+    if "расчет с дилером" not in t:
+        return None
+    def grab(label):
+        m = re.search(label + r"[^\n\d]*([\d][\d,. ]*)", t)
+        return _num(m.group(1)) if m else 0
+    data = {
+        "price_krw":  grab(r"цена[^\n:]*"),
+        "torg_krw":   grab(r"торг"),
+        "zalog_krw":  grab(r"залог"),
+        "medobi_krw": grab(r"медоби"),
+    }
+    return data if data["price_krw"] else None
 
 async def process_assistant(update: Update, text: str):
     try:
+        dealer = parse_dealer_text(text)
+        if dealer:
+            await update.message.reply_text(format_dealer(dealer))
+            return
         result = await ask_claude(text, update.message.chat_id)
         intent = result.get("intent"); reply = result.get("reply", ""); data = result.get("data", {})
 
@@ -453,7 +484,7 @@ async def process_assistant(update: Update, text: str):
             await update.message.reply_text(format_full_calc(data), parse_mode="Markdown")
 
         elif intent == "dealer":
-            await update.message.reply_text(format_dealer(data), parse_mode="Markdown")
+            await update.message.reply_text(format_dealer(data))
 
         elif intent == "calendar":
             try:

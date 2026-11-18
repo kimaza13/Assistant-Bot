@@ -130,7 +130,7 @@ def collect_dealer_text(node, found=None, under_text=False) -> str:
         found.append(node.strip())
     return "\n".join(found)
 
-CLEAN_RE = re.compile(r"NO\s*PAINT|NO\s*ACCIDENT|무\s*도색|무\s*사고|무\s*판금", re.I)
+CLEAN_RE = re.compile(r"NO\s*PAINT|NO\s*ACCIDENT|노\s*페인트|무\s*도색|무\s*사고|무\s*판금", re.I)
 DAMAGE_WORDS = [
     (re.compile(r"PAINT|도색|재도장|\b페인트", re.I), "окрас"),
     (re.compile(r"판금|PANEL|SHEET\s*METAL", re.I), "жестянка"),
@@ -143,13 +143,16 @@ def parse_dealer_notes(text: str) -> dict:
     out = {}
     if not text:
         return out
-    m = re.search(r"KEY\s*[:=]?\s*(\d)", text, re.I) or re.search(r"키\s*(\d)\s*개", text) \
-        or re.search(r"스마트키\s*(\d)", text)
+    m = re.search(r"KEY\s*[:=]?\s*(\d)", text, re.I) or re.search(r"차\s*키\s*(\d)", text) \
+        or re.search(r"키\s*(\d)\s*개", text) or re.search(r"스마트키\s*(\d)", text)
     if m and m.group(1) in ("1", "2"):
         out["keys"] = m.group(1)
-    m = re.search(r"TAX\s*[:=]?\s*(\d{1,3})\s*%", text, re.I) or re.search(r"세금\s*(\d{1,3})\s*%", text)
+    m = re.search(r"TAX\s*[:=]?\s*(\d{1,3})\s*%", text, re.I) or re.search(r"세금\s*(\d{1,3})\s*%", text) \
+        or re.search(r"계산서\s*(\d{1,3})\s*%", text)
     if m:
         out["kesanso"] = f"{int(m.group(1))}%"
+    elif re.search(r"세금\s*계산서(?!\s*(?:불가|없|별도|X))", text, re.I):
+        out["kesanso"] = "100%"   # «세금계산서» без процента = кесансо 100%
     clean = bool(CLEAN_RE.search(text))
     rest = CLEAN_RE.sub(" ", text)
     found = [ru for rx, ru in DAMAGE_WORDS if rx.search(rest)]

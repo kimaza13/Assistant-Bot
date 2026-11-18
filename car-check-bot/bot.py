@@ -114,6 +114,51 @@ def find_listing(text: str):
         return "kb", m.group(1), m.group(0)
     return None
 
+# ── Разбор описания дилера (NO PAINT, TAX100%, KEY2EA ...) ────────────────────
+TEXT_KEYS = {"text", "comment", "description", "memo", "content", "contents", "remark", "advertisementtext"}
+
+def collect_dealer_text(node, found=None, under_text=False) -> str:
+    """Собирает строки из полей JSON, где дилер пишет описание."""
+    found = [] if found is None else found
+    if isinstance(node, dict):
+        for k, v in node.items():
+            collect_dealer_text(v, found, under_text or str(k).lower() in TEXT_KEYS)
+    elif isinstance(node, list):
+        for v in node:
+            collect_dealer_text(v, found, under_text)
+    elif isinstance(node, str) and under_text and node.strip():
+        found.append(node.strip())
+    return "\n".join(found)
+
+CLEAN_RE = re.compile(r"NO\s*PAINT|NO\s*ACCIDENT|무\s*도색|무\s*사고|무\s*판금", re.I)
+DAMAGE_WORDS = [
+    (re.compile(r"PAINT|도색|재도장|\b페인트", re.I), "окрас"),
+    (re.compile(r"판금|PANEL|SHEET\s*METAL", re.I), "жестянка"),
+    (re.compile(r"교환|EXCHANGE|REPLACE", re.I), "замена"),
+    (re.compile(r"용접|WELD", re.I), "сварка"),
+]
+
+def parse_dealer_notes(text: str) -> dict:
+    """Жёсткие правила: ключи, кесансо, состояние из текста дилера. Без нейросети."""
+    out = {}
+    if not text:
+        return out
+    m = re.search(r"KEY\s*[:=]?\s*(\d)", text, re.I) or re.search(r"키\s*(\d)\s*개", text) \
+        or re.search(r"스마트키\s*(\d)", text)
+    if m and m.group(1) in ("1", "2"):
+        out["keys"] = m.group(1)
+    m = re.search(r"TAX\s*[:=]?\s*(\d{1,3})\s*%", text, re.I) or re.search(r"세금\s*(\d{1,3})\s*%", text)
+    if m:
+        out["kesanso"] = f"{int(m.group(1))}%"
+    clean = bool(CLEAN_RE.search(text))
+    rest = CLEAN_RE.sub(" ", text)
+    found = [ru for rx, ru in DAMAGE_WORDS if rx.search(rest)]
+    if found:
+        out["condition"] = "есть " + ", ".join(found) + ", надо смотреть"
+    elif clean:
+        out["condition"] = "чистая"
+    return out
+
 async def fetch_encar(car_id: str, log: list = None) -> dict:
     headers = {**WEB_HEADERS, "Origin": "https://fem.encar.com",
                "Referer": f"https://fem.encar.com/cars/detail/{car_id}"}
@@ -143,6 +188,9 @@ async def fetch_encar(car_id: str, log: list = None) -> dict:
         out["price"] = str(int(price_man) * 10000)
     if address:
         out["city"] = translate_city(address)
+    dealer_text = collect_dealer_text(d)
+    out.update(parse_dealer_notes(dealer_text))
+    out["_text"] = dealer_text[:300]
     return out
 
 async def fetch_kb(car_seq: str, log: list = None) -> dict:
@@ -620,7 +668,7 @@ async def handle_encar_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["cc"] = {"url": url}
     wait_msg = await update.message.reply_text("⏳ Загружаю данные авто...")
     parsed = await fetch_listing(text_in)
-    for key in ("name", "plate", "price", "city"):
+    for key in ("name", "plate", "price", "city", "keys", "condition", "kesanso"):
         if parsed.get(key):
             ctx.user_data["cc"][key] = parsed[key]
     await wait_msg.delete()

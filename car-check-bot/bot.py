@@ -442,6 +442,8 @@ def fmt_money(val) -> str:
     val = str(val)
     if val in ("—", "нет", ""):
         return val or "—"
+    if "%" in val:          # «100%» оставляем как есть, а не превращаем в «100»
+        return val
     nums = re.findall(r"\d+", val.replace(",", "").replace(" ", ""))
     if nums:
         try:
@@ -484,11 +486,15 @@ def format_car_card(d: dict) -> str:
     ])
 
 # ── Форма ─────────────────────────────────────────────────────────────────────
+def md_escape(text) -> str:
+    """Экранирует символы Markdown (Telegram, parse_mode=Markdown), чтобы имя дилера и т.п. не ломали сообщение."""
+    return re.sub(r"([_*`\[])", r"\\\1", str(text))
+
 def fv(d, key, fmt=False):
     v = d.get(key)
     if not v or v == "—":
         return "—"
-    return fmt_money(v) if fmt else v
+    return md_escape(fmt_money(v) if fmt else v)
 
 def dot(d, key, target):
     return " ✅" if d.get(key) == target else ""

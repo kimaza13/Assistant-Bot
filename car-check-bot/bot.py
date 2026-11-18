@@ -434,7 +434,7 @@ def format_dealer(data: dict) -> str:
     medobi = abs(int(data.get("medobi_krw", 0) or 0))
     ostatok = price - torg - zalog + medobi
     return "\n".join([
-        "Давай считать:", "",
+        "💵 Расчёт с дилером", "",
         f"Цена по сайту: {price:,}",
         f"Минус торг: -{torg:,}",
         f"Минус залог: -{zalog:,}",

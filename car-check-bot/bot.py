@@ -1,4 +1,5 @@
 import os
+import asyncio
 import re
 import json
 import logging
@@ -136,6 +137,7 @@ DAMAGE_WORDS = [
     (re.compile(r"판금|PANEL|SHEET\s*METAL", re.I), "жестянка"),
     (re.compile(r"교환|EXCHANGE|REPLACE", re.I), "замена"),
     (re.compile(r"용접|WELD", re.I), "сварка"),
+    (re.compile(r"단순\s*수리|SIMPLE\s*REPAIR", re.I), "простой ремонт"),
 ]
 
 def parse_dealer_notes(text: str) -> dict:
@@ -143,7 +145,7 @@ def parse_dealer_notes(text: str) -> dict:
     out = {}
     if not text:
         return out
-    m = re.search(r"KEY\s*[:=]?\s*(\d)", text, re.I) or re.search(r"차\s*키\s*(\d)", text) \
+    m = re.search(r"KEYS?\s*[:=]?\s*(\d)", text, re.I) or re.search(r"(\d)\s*(?:EA\s*)?(?:SMART\s*)?KEYS?", text, re.I) or re.search(r"차\s*키\s*(\d)", text) \
         or re.search(r"키\s*(\d)\s*개", text) or re.search(r"스마트키\s*(\d)", text)
     if m and m.group(1) in ("1", "2"):
         out["keys"] = m.group(1)
@@ -160,7 +162,83 @@ def parse_dealer_notes(text: str) -> dict:
         out["condition"] = "есть " + ", ".join(found) + ", надо смотреть"
     elif clean:
         out["condition"] = "чистая"
+    out["_damage"] = found
+    out["_clean"] = clean
     return out
+
+# ── Осмотр (성능점검) и страховая история (보험이력) ────────────────────────────
+STATUS_RU = {"X": "замена", "W": "окрас", "A": "царапина", "U": "вмятина", "C": "коррозия", "T": "повреждение"}
+PANEL_TOKENS = [
+    ("라디에이터 서포트", "рамка радиатора"), ("라디에이터", "радиатор"),
+    ("프론트 휀더", "переднее крыло"), ("프론트 펜더", "переднее крыло"), ("프론트휀더", "переднее крыло"),
+    ("리어 휀더", "заднее крыло"), ("리어휀더", "заднее крыло"), ("휀더", "крыло"),
+    ("본넷", "капот"), ("후드", "капот"),
+    ("트렁크 리드", "крышка багажника"), ("트렁크 플로어", "пол багажника"), ("트렁크", "багажник"),
+    ("프론트 도어", "передняя дверь"), ("리어 도어", "задняя дверь"), ("도어", "дверь"),
+    ("루프 패널", "крыша"), ("루프", "крыша"),
+    ("쿼터 패널", "задняя боковина"), ("쿼터", "задняя боковина"),
+    ("사이드 실 패널", "порог"), ("사이드실 패널", "порог"), ("사이드실", "порог"),
+    ("프론트 패널", "передняя панель"), ("리어 패널", "задняя панель"),
+    ("필러 패널", "стойка"), ("필러", "стойка"), ("휠하우스", "арка"),
+    ("크로스 멤버", "кросс-мембер"), ("크로스멤버", "кросс-мембер"),
+    ("사이드 멤버", "лонжерон"), ("사이드멤버", "лонжерон"),
+    ("플로어 패널", "пол"), ("패키지 트레이", "полка"), ("패키지트레이", "полка"),
+    ("인사이드 패널", "внутр. панель"), ("대시 패널", "щиток"),
+    ("(좌)", " лев."), ("(우)", " прав."), ("좌측", " лев."), ("우측", " прав."),
+]
+
+def translate_panel(title: str) -> str:
+    t = title or ""
+    for kr, ru in sorted(PANEL_TOKENS, key=lambda x: -len(x[0])):
+        t = t.replace(kr, ru)
+    return re.sub(r"\s+", " ", t).strip()
+
+def parse_inspection(data):
+    """Ищет в JSON осмотра детали с отметками X (замена), W (жестянка/окрас) и др.
+    Возвращает ({код: [детали]}, сколько_узлов_с_statusTypes_увидели)."""
+    found, seen = {}, [0]
+    def walk(n, title=None):
+        if isinstance(n, dict):
+            ty = n.get("type")
+            t = (ty.get("title") or ty.get("name")) if isinstance(ty, dict) else None
+            t = t or n.get("title") or n.get("name") or title
+            sts = n.get("statusTypes")
+            if isinstance(sts, list):
+                seen[0] += 1
+                for st in sts:
+                    code = st.get("code") if isinstance(st, dict) else st
+                    if code in STATUS_RU and t:
+                        lst = found.setdefault(code, [])
+                        name = translate_panel(str(t))
+                        if name not in lst:
+                            lst.append(name)
+            for v in n.values():
+                walk(v, t)
+        elif isinstance(n, list):
+            for v in n:
+                walk(v, title)
+    walk(data)
+    return found, seen[0]
+
+def _int(x) -> int:
+    try:
+        return int(x or 0)
+    except Exception:
+        return 0
+
+def parse_record(d: dict) -> list:
+    """Страховая история: свои/чужие ДТП, полная потеря, затопление, угон."""
+    bits = []
+    my, other = _int(d.get("myAccidentCnt")), _int(d.get("otherAccidentCnt"))
+    if my or other:
+        bits.append(f"страховые случаи: свой {my}, чужой {other}")
+    if _int(d.get("totalLossCnt")):
+        bits.append("полная потеря")
+    if _int(d.get("floodTotalLossCnt")) or _int(d.get("floodPartLossCnt")):
+        bits.append("затопление")
+    if _int(d.get("robberCnt")):
+        bits.append("угон")
+    return bits
 
 async def fetch_encar(car_id: str, log: list = None) -> dict:
     headers = {**WEB_HEADERS, "Origin": "https://fem.encar.com",
@@ -192,8 +270,61 @@ async def fetch_encar(car_id: str, log: list = None) -> dict:
     if address:
         out["city"] = translate_city(address)
     dealer_text = collect_dealer_text(d)
-    out.update(parse_dealer_notes(dealer_text))
+
+    # осмотр и страховая история — параллельно
+    plate = d.get("vehicleNo") or ""
+    async def get_json(client, u, params=None):
+        try:
+            r = await client.get(u, headers=headers, params=params)
+            if log is not None:
+                log.append(f"{u} → {r.status_code}, {len(r.content)} байт\n{r.text[:200]!r}")
+            return (r.json(), r.text) if r.status_code == 200 else (None, "")
+        except Exception as e:
+            logger.warning(f"encar extra failed: {e}")
+            if log is not None:
+                log.append(f"{u} → ошибка: {e}")
+            return None, ""
+    async with _client() as client:
+        (insp_json, insp_text), (rec_json, rec_text) = await asyncio.gather(
+            get_json(client, f"https://api.encar.com/v1/readside/inspection/vehicle/{car_id}"),
+            get_json(client, f"https://api.encar.com/v1/readside/record/vehicle/{car_id}/open",
+                     {"vehicleNo": plate} if plate else None),
+        )
+    marks, seen = parse_inspection(insp_json) if insp_json else ({}, 0)
+    rec_bits = parse_record(rec_json) if isinstance(rec_json, dict) else []
+    simple = any("단순수리" in t or re.search(r'"simpleRepair"\s*:\s*true', t)
+                 for t in (resp.text, insp_text, rec_text))
+
+    dealer = parse_dealer_notes(dealer_text)
+    damage = dealer.pop("_damage", [])
+    clean = dealer.pop("_clean", False)
+    dealer.pop("condition", None)
+    out.update(dealer)
+
+    items = []
+    for code in ("X", "W", "A", "U", "C", "T"):          # замена, окрас, прочее
+        if marks.get(code):
+            items.append(f"{STATUS_RU[code]}: " + ", ".join(marks[code]))
+    for w in damage:                                      # слова из текста дилера, не дублируя осмотр
+        if w == "окрас" and marks.get("W"):
+            continue
+        if w == "замена" and marks.get("X"):
+            continue
+        if w == "жестянка" and marks.get("W"):
+            continue
+        items.append(w)
+    if simple and "простой ремонт" not in items:
+        items.append("простой ремонт")
+    items += rec_bits
+    if insp_json and seen == 0:
+        items.append("осмотр проверить вручную")        # структура не распознана — не утверждаем «чистая»
+    if items:
+        out["condition"] = "; ".join(items) + "; надо смотреть"
+    elif clean:
+        out["condition"] = "чистая"
     out["_text"] = dealer_text[:300]
+    out["_marks"] = marks
+    out["_rec"] = rec_bits
     return out
 
 async def fetch_kb(car_seq: str, log: list = None) -> dict:
